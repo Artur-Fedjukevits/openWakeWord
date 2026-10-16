@@ -16,6 +16,7 @@
 from multiprocessing.pool import ThreadPool
 import os
 import re
+import time
 import logging
 from functools import partial
 from pathlib import Path
@@ -33,6 +34,18 @@ from speechbrain.dataio.dataio import read_audio
 from speechbrain.processing.signal_processing import reverberate
 import torchaudio
 import mutagen
+
+# torchaudio >= 2.9 removed torchaudio.info, which torch_audiomentations still uses
+# to read background clip metadata. Provide a soundfile-based replacement.
+if not hasattr(torchaudio, "info"):
+    import soundfile
+    from types import SimpleNamespace
+
+    def _torchaudio_info(path, *args, **kwargs):
+        i = soundfile.info(str(path))
+        return SimpleNamespace(num_frames=i.frames, sample_rate=i.samplerate, num_channels=i.channels)
+
+    torchaudio.info = _torchaudio_info
 import acoustics
 
 
@@ -819,17 +832,20 @@ class mmap_batch_generator:
         return self
 
     def __next__(self):
+        # Random rows instead of a sequential sweep: features are stored in file order, so
+        # consecutive rows are near-duplicates (same source, same augmentation batch).
+        # The RNG is created lazily so every DataLoader worker (a forked copy of this object)
+        # gets its own seed — otherwise all workers would yield identical batches.
+        if getattr(self, "_rng", None) is None:
+            self._rng = np.random.default_rng([os.getpid(), time.time_ns() % (2**32)])
+
         # Build batch
         while True:
             X, y = [], []
             for label, n in self.n_per_class.items():
-                # Restart at zeroth index if an array reaches the end
-                if self.data_counter[label] >= self.shapes[label][0]:
-                    self.data_counter[label] = 0
-
-                # Get data from mmaped file
-                x = self.data[label][self.data_counter[label]:self.data_counter[label]+n]
-                self.data_counter[label] += x.shape[0]
+                n_rows = self.shapes[label][0]
+                ndcs = np.sort(self._rng.choice(n_rows, size=min(n, n_rows), replace=False))
+                x = self.data[label][ndcs]
 
                 # Transform data
                 if self.data_transform_funcs and self.data_transform_funcs.get(label):
@@ -837,7 +853,7 @@ class mmap_batch_generator:
 
                 # Make labels for data (following whatever the current shape of `x` is)
                 if self.label_files.get(label, None):
-                    y_batch = self.labels[label][self.data_counter[label]:self.data_counter[label]+n]
+                    y_batch = self.labels[label][ndcs]
                 else:
                     y_batch = [label]*x.shape[0]
 

@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────
+# Конфиг v8 для wake word "Эй Лёня"
+# Данные собирает build_v8_dataset.py в my_custom_model/ey_lyonya_v8/
+# Отличия от v7: голос nicole, room_neg (6 ч записи комнаты + новые sv_debug),
+# валидация реальных записей без добавочного шума, max_negative_weight 2500, мягче выбор чекпоинта
+# Запуск:
+#   python openwakeword/train.py --training_config ey_lyonya_v8.yml --augment_clips --train_model
+# ─────────────────────────────────────────────────────────────
+
+model_name: ey_lyonya_v8
+seed: 8
+
+target_phrase:
+  - "эй лёня"
+  - "эй леня"
+
+output_dir: /home/artur/openWakeWord/my_custom_model
+
+background_paths:
+  - /home/artur/openWakeWord/audioset_16k
+  - /home/artur/openWakeWord/fma
+  - /home/artur/openWakeWord/room_background
+  - /home/artur/openWakeWord/room_household_bg   # 6 ч записи комнаты 2026-10-15 (без «Лёня»)
+background_paths_duplication_rate:
+  - 1
+  - 1
+  - 20    # room_background: 168 клипов ×20
+  - 4     # room_household_bg: ~2300 клипов ×4 — вместе с room_background около трети пула фона
+
+rir_paths:
+  - /home/artur/openWakeWord/mit_rirs
+
+feature_data_files:
+  ACAV100M_sample: /home/artur/openWakeWord/openwakeword_features_ACAV100M_2000_hrs_16bit.npy
+
+false_positive_validation_data_path: /home/artur/validation_set_features.npy
+
+n_samples: 0
+n_samples_val: 0
+piper_sample_generator_path: /home/artur/openWakeWord/piper-sample-generator
+tts_batch_size: 50
+
+# Синтетики теперь ~15k позитивов и ~19k негативов — двух раундов аугментации хватает
+augmentation_rounds: 2
+augmentation_batch_size: 16
+
+# Реальные записи — отдельные источники: их доля в батче задаётся batch_n, а не числом файлов.
+# rir: false — записи уже сделаны в комнате через Jabra, второе эхо поверх не нужно.
+# test_dir — валидация: по ней выбирается чекпоинт (финальный test — final_test_files.txt).
+extra_sources:
+  real_positive:          # твой голос: комната, старые записи, записи робота
+    label: 1
+    train_dir: /home/artur/openWakeWord/my_custom_model/ey_lyonya_v8/real_positive_train
+    test_dir: /home/artur/openWakeWord/my_custom_model/ey_lyonya_v8/real_positive_test
+    batch_n: 32
+    rounds: 6
+    test_rounds: 1
+    test_augment: false   # валидация без добавочного шума: осмысленный recall для выбора чекпоинта
+    rir: false
+  real_fp:                # ложные срабатывания робота, 4 окна по 2 с на запись
+    label: 0
+    train_dir: /home/artur/openWakeWord/my_custom_model/ey_lyonya_v8/real_fp_train
+    test_dir: /home/artur/openWakeWord/my_custom_model/ey_lyonya_v8/real_fp_test
+    batch_n: 48
+    rounds: 8
+    test_rounds: 1
+    test_augment: false
+    rir: false
+  room_neg:               # 6 ч записи комнаты (ТВ, дети, бытовые звуки) + новые sv_debug, без «Лёня»
+    label: 0
+    train_dir: /home/artur/openWakeWord/my_custom_model/ey_lyonya_v8/room_neg_train
+    test_dir: /home/artur/openWakeWord/my_custom_model/ey_lyonya_v8/room_neg_test
+    batch_n: 64
+    rounds: 2
+    test_rounds: 1
+    test_augment: false
+    rir: false
+
+model_type: rnn
+layer_size: 64
+steps: 50000
+
+batch_n_per_class:
+  ACAV100M_sample: 256      # общие негативы (2000 ч)
+  adversarial_negative: 150 # фонетические негативы, речь и фон комнаты, тишина
+  positive: 128             # синтетика: Silero (случайные голоса), OmniVoice (Артур, Настя)
+  # real_positive / real_fp — batch_n из extra_sources
+
+# Во 2-й и 3-й фазе удваивается, если best_val_fp > target_false_positives_per_hour
+# (теперь best_val_fp действительно считается).
+max_negative_weight: 2500   # v7 после выравнивания позитивов стал слишком «чувствительным»
+
+# Метрики при обучении считаются при рабочих настройках робота
+eval_threshold: 0.8
+eval_patience: 2
+
+# Выбор чекпоинта (checkpoint_selection: targets, см. Model.select_checkpoint):
+#   recall на real_positive >= target_recall → val_fp_per_hr <= target → меньше real_fp
+checkpoint_selection: targets
+target_recall: 0.9          # на чистых реальных записях (одно окно)
+selection_recall_slack: 0.10
+target_false_positives_per_hour: 0.05
+target_accuracy: 0.0

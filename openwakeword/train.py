@@ -11,6 +11,8 @@ import numpy as np
 import scipy
 import collections
 import argparse
+import csv
+import random
 import logging
 from tqdm import tqdm
 import yaml
@@ -24,8 +26,17 @@ from openwakeword.utils import AudioFeatures
 # Base model class for an openwakeword model
 class Model(nn.Module):
     def __init__(self, n_classes=1, input_shape=(16, 96), model_type="dnn",
-                 layer_dim=128, n_blocks=1, seconds_per_example=None):
+                 layer_dim=128, n_blocks=1, seconds_per_example=None,
+                 eval_threshold=0.5, eval_patience=1):
         super().__init__()
+
+        # Validation metrics are computed at the threshold/patience the model is deployed with
+        self.eval_threshold = eval_threshold
+        self.eval_patience = eval_patience
+        self.checkpoints = []      # every validation step: {"metrics": {...}, "state": state_dict}
+        self.checkpoint_dir = None
+        self.extra_val = {}        # name -> (features tensor, label): e.g. real positives / real false triggers
+        self.seq = 0
 
         # Store inputs as attributes
         self.n_classes = n_classes
@@ -97,9 +108,10 @@ class Model(nn.Module):
 
         # Define metrics
         if n_classes == 1:
-            self.fp = lambda pred, y: (y-pred <= -0.5).sum()
-            self.recall = torchmetrics.Recall(task='binary')
-            self.accuracy = torchmetrics.Accuracy(task='binary')
+            thr = eval_threshold
+            self.fp = lambda pred, y: ((pred >= thr) & (y < 0.5)).sum()
+            self.recall = torchmetrics.Recall(task='binary', threshold=thr)
+            self.accuracy = torchmetrics.Accuracy(task='binary', threshold=thr)
         else:
             def multiclass_fp(p, y, threshold=0.5):
                 probs = torch.nn.functional.softmax(p, dim=1)
@@ -258,8 +270,67 @@ class Model(nn.Module):
 
         return best_model
 
+    def count_activations(self, scores):
+        """Activations in a continuous stream of per-frame (80 ms) scores, counted like wakeword_node:
+        `eval_patience` consecutive frames >= `eval_threshold`, then a 1.5 s refractory period."""
+        debounce = int(1.5/0.08)
+        n, run, last = 0, 0, -debounce
+        for i, above in enumerate(np.asarray(scores) >= self.eval_threshold):
+            run = run + 1 if above else 0
+            if run >= self.eval_patience and i - last >= debounce:
+                n, last, run = n + 1, i, 0
+        return n
+
+    def evaluate_extra(self, model=None):
+        """Recall (label 1) or false-trigger rate (label 0) at eval_threshold for each extra validation set."""
+        model = self.model if model is None else model
+        out = {}
+        with torch.no_grad():
+            for name, (x, label) in self.extra_val.items():
+                scores = torch.cat([model(x[i:i+4096].to(self.device)).squeeze(-1).cpu()
+                                    for i in range(0, len(x), 4096)])
+                rate = (scores >= self.eval_threshold).float().mean().item()
+                out[f"{name}_recall" if label == 1 else f"{name}_fp_rate"] = rate
+        return out
+
+    def select_checkpoint(self, target_recall, target_fp_per_hour, csv_path=None, recall_slack=0.03):
+        """Pick one saved checkpoint by the training targets instead of percentile averaging:
+        1. recall >= target_recall (on the real positives if they are an extra validation set);
+           if no checkpoint gets there, keep those within `recall_slack` of the best recall;
+        2. among them, prefer val_fp_per_hr <= target_fp_per_hour;
+        3. then the lowest real false-trigger rate, then the lowest val_fp_per_hr."""
+        rows = [c["metrics"] for c in self.checkpoints]
+        rec_key = next((k for k in rows[0] if k.endswith("_recall") and k != "val_recall"), "val_recall")
+        fp_keys = [k for k in rows[0] if k.endswith("_fp_rate")]
+
+        if csv_path:
+            with open(csv_path, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+                w.writeheader()
+                w.writerows(rows)
+
+        pool = [i for i, r in enumerate(rows) if r[rec_key] >= target_recall]
+        if pool:
+            reason = f"{rec_key} >= {target_recall}"
+        else:
+            best = max(r[rec_key] for r in rows)
+            pool = [i for i, r in enumerate(rows) if r[rec_key] >= best - recall_slack]
+            reason = (f"no checkpoint reaches {rec_key} >= {target_recall}; "
+                      f"kept recall within {recall_slack} of the best ({best:.3f})")
+        within_fp = [i for i in pool if rows[i]["val_fp_per_hr"] <= target_fp_per_hour]
+        if within_fp:
+            pool = within_fp
+            reason += f", val_fp_per_hr <= {target_fp_per_hour}"
+        best_i = min(pool, key=lambda i: (sum(rows[i][k] for k in fp_keys), rows[i]["val_fp_per_hr"], -rows[i][rec_key]))
+
+        logging.warning(f"Selected checkpoint {rows[best_i]} ({reason}; {len(pool)} candidates of {len(rows)})")
+        model = copy.deepcopy(self.model)
+        model.load_state_dict(self.checkpoints[best_i]["state"])
+        return model
+
     def auto_train(self, X_train, X_val, false_positive_val_data, steps=50000, max_negative_weight=1000,
-                   target_fp_per_hour=0.2):
+                   target_fp_per_hour=0.2, target_recall=0.0, selection="average", metrics_csv=None,
+                   recall_slack=0.03):
         """A sequence of training steps that produce relatively strong models
         automatically, based on validation data and performance targets provided.
         After training merges the best checkpoints and returns a single model.
@@ -269,6 +340,7 @@ class Model(nn.Module):
         val_set_hrs = 11.3
 
         # Sequence 1
+        self.seq = 1
         logging.info("#"*50 + "\nStarting training sequence 1...\n" + "#"*50)
         lr = 0.0001
         weights = np.linspace(1, max_negative_weight, int(steps)).tolist()
@@ -283,6 +355,7 @@ class Model(nn.Module):
                     hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
 
         # Sequence 2
+        self.seq = 2
         logging.info("#"*50 + "\nStarting training sequence 2...\n" + "#"*50)
         lr = lr/10
         steps = steps/10
@@ -304,6 +377,7 @@ class Model(nn.Module):
                     hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
 
         # Sequence 3
+        self.seq = 3
         logging.info("#"*50 + "\nStarting training sequence 3...\n" + "#"*50)
         lr = lr/10
 
@@ -322,6 +396,10 @@ class Model(nn.Module):
                     negative_weight_schedule=weights,
                     val_steps=val_steps, warmup_steps=steps//5,
                     hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
+
+        if selection == "targets":
+            return self.select_checkpoint(target_recall, target_fp_per_hour, csv_path=metrics_csv,
+                                          recall_slack=recall_slack)
 
         # Merge best models
         logging.info("Merging checkpoints above the 90th percentile into single model...")
@@ -512,14 +590,14 @@ class Model(nn.Module):
             # Run validation and log validation metrics
             if step_ndx in val_steps and step_ndx > 1 and false_positive_val_data is not None:
                 # Get false positives per hour with false positive data
-                val_fp = 0
+                # The windows are a continuous stream (stride 1 frame): count activations, not frames
+                val_scores = []
                 for val_step_ndx, data in enumerate(false_positive_val_data):
                     with torch.no_grad():
-                        x_val, y_val = data[0].to(self.device), data[1].to(self.device)
-                        val_predictions = self.model(x_val)
-                        val_fp += self.fp(val_predictions, y_val[..., None])
-                val_fp_per_hr = (val_fp/val_set_hrs).detach().cpu().numpy()
+                        val_scores.append(self.model(data[0].to(self.device)).squeeze(-1).cpu().numpy())
+                val_fp_per_hr = self.count_activations(np.concatenate(val_scores))/val_set_hrs
                 self.history["val_fp_per_hr"].append(val_fp_per_hr)
+                self.best_val_fp = min(self.best_val_fp, val_fp_per_hr)
 
             # Get recall on test clips
             if step_ndx in val_steps and step_ndx > 1 and positive_test_clips is not None:
@@ -551,6 +629,20 @@ class Model(nn.Module):
                 self.history["val_accuracy"].append(val_acc.detach().cpu().numpy())
                 self.history["val_recall"].append(val_recall)
                 self.history["val_n_fp"].append(val_fp.detach().cpu().numpy())
+
+            # Keep every validation checkpoint with its metrics (for select_checkpoint / comparison)
+            if step_ndx in val_steps and step_ndx > 1:
+                metrics = {"seq": self.seq, "training_step_ndx": int(step_ndx),
+                           "val_recall": float(self.history["val_recall"][-1]) if X_val is not None else 0.0,
+                           "val_accuracy": float(self.history["val_accuracy"][-1]) if X_val is not None else 0.0,
+                           "val_fp_per_hr": float(self.history["val_fp_per_hr"][-1]) if false_positive_val_data is not None else 0.0,
+                           **self.evaluate_extra()}
+                self.checkpoints.append({"metrics": metrics, "state": copy.deepcopy(self.model.state_dict())})
+                if self.checkpoint_dir:
+                    torch.save(self.checkpoints[-1]["state"],
+                               os.path.join(self.checkpoint_dir, f"seq{self.seq}_step{int(step_ndx)}.pt"))
+                logging.warning("checkpoint " + ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                                                         for k, v in metrics.items()))
 
             # Save models with a validation score above/below the 90th percentile
             # of the validation scores up to that point
@@ -606,44 +698,45 @@ if __name__ == '__main__':
         "--generate_clips",
         help="Execute the synthetic data generation process",
         action="store_true",
-        default="False",
+        default=False,
         required=False
     )
     parser.add_argument(
         "--augment_clips",
         help="Execute the synthetic data augmentation process",
         action="store_true",
-        default="False",
+        default=False,
         required=False
     )
     parser.add_argument(
         "--overwrite",
         help="Overwrite existing openwakeword features when the --augment_clips flag is used",
         action="store_true",
-        default="False",
+        default=False,
         required=False
     )
     parser.add_argument(
         "--train_model",
         help="Execute the model training process",
         action="store_true",
-        default="False",
+        default=False,
         required=False
     )
     parser.add_argument(
         "--convert_to_tflite",
         help="Convert the trained ONNX model to TFLite format",
         action="store_true",
-        default="False",
+        default=False,
         required=False
     )
 
     args = parser.parse_args()
     config = yaml.load(open(args.training_config, 'r').read(), yaml.Loader)
 
-    # imports Piper for synthetic sample generation
-    sys.path.insert(0, os.path.abspath(config["piper_sample_generator_path"]))
-    from generate_samples import generate_samples
+    # imports Piper for synthetic sample generation (only if actually needed)
+    if args.generate_clips is True and config.get("n_samples", 0) > 0:
+        sys.path.insert(0, os.path.abspath(config["piper_sample_generator_path"]))
+        from generate_samples import generate_samples
 
     # Define output locations
     config["output_dir"] = os.path.abspath(config["output_dir"])
@@ -758,27 +851,36 @@ if __name__ == '__main__':
         config["total_length"] = 32000
 
     # Do Data Augmentation
+    # Clip lists are shuffled before augmentation: the second-pass augmentations and the RIR are applied
+    # per batch, so in file order every copy/neighbour of a clip would get the same background and room.
+    random.seed(config.get("seed", 0))
+    n_cpus = os.cpu_count()
+    n_cpus = 1 if n_cpus is None else n_cpus//2
     if args.augment_clips is True:
         if not os.path.exists(os.path.join(feature_save_dir, "positive_features_train.npy")) or args.overwrite is True:
             positive_clips_train = [str(i) for i in Path(positive_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+            random.shuffle(positive_clips_train)
             positive_clips_train_generator = augment_clips(positive_clips_train, total_length=config["total_length"],
                                                            batch_size=config["augmentation_batch_size"],
                                                            background_clip_paths=background_paths,
                                                            RIR_paths=rir_paths)
 
             positive_clips_test = [str(i) for i in Path(positive_test_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+            random.shuffle(positive_clips_test)
             positive_clips_test_generator = augment_clips(positive_clips_test, total_length=config["total_length"],
                                                           batch_size=config["augmentation_batch_size"],
                                                           background_clip_paths=background_paths,
                                                           RIR_paths=rir_paths)
 
             negative_clips_train = [str(i) for i in Path(negative_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+            random.shuffle(negative_clips_train)
             negative_clips_train_generator = augment_clips(negative_clips_train, total_length=config["total_length"],
                                                            batch_size=config["augmentation_batch_size"],
                                                            background_clip_paths=background_paths,
                                                            RIR_paths=rir_paths)
 
             negative_clips_test = [str(i) for i in Path(negative_test_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+            random.shuffle(negative_clips_test)
             negative_clips_test_generator = augment_clips(negative_clips_test, total_length=config["total_length"],
                                                           batch_size=config["augmentation_batch_size"],
                                                           background_clip_paths=background_paths,
@@ -791,25 +893,25 @@ if __name__ == '__main__':
                 n_cpus = 1
             else:
                 n_cpus = n_cpus//2
-            compute_features_from_generator(positive_clips_train_generator, n_total=len(os.listdir(positive_train_output_dir)),
+            compute_features_from_generator(positive_clips_train_generator, n_total=len(positive_clips_train),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_train.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
-            compute_features_from_generator(negative_clips_train_generator, n_total=len(os.listdir(negative_train_output_dir)),
+            compute_features_from_generator(negative_clips_train_generator, n_total=len(negative_clips_train),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_train.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
-            compute_features_from_generator(positive_clips_test_generator, n_total=len(os.listdir(positive_test_output_dir)),
+            compute_features_from_generator(positive_clips_test_generator, n_total=len(positive_clips_test),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_test.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
-            compute_features_from_generator(negative_clips_test_generator, n_total=len(os.listdir(negative_test_output_dir)),
+            compute_features_from_generator(negative_clips_test_generator, n_total=len(negative_clips_test),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_test.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
@@ -817,13 +919,48 @@ if __name__ == '__main__':
         else:
             logging.warning("Openwakeword features already exist, skipping data augmentation and feature generation")
 
+        # Extra sources (e.g. real recordings of the speaker, real false triggers from the robot) get their own
+        # feature files, so their share in every batch is set by `batch_n` and not by how many files they have.
+        # Each source is computed independently: adding a source does not recompute the others.
+        for name, src in config.get("extra_sources", {}).items():
+            for split in ("train", "test"):
+                out_file = os.path.join(feature_save_dir, f"{name}_features_{split}.npy")
+                if os.path.exists(out_file) and args.overwrite is not True:
+                    continue
+                rounds = src.get("rounds", 1) if split == "train" else src.get("test_rounds", 1)
+                clips = [str(i) for i in Path(src[f"{split}_dir"]).glob("*.wav")]*rounds
+                random.shuffle(clips)
+                logging.warning(f"Computing features for extra source '{name}' ({split}): {len(clips)} clips")
+                # test_augment: false — validation clips get no added noise/reverb (only padding), so the
+                # recall used to pick a checkpoint reflects the recordings, not -10 dB SNR augmentation
+                clean = split == "test" and src.get("test_augment", True) is False
+                generator = augment_clips(clips, total_length=config["total_length"],
+                                          batch_size=config["augmentation_batch_size"],
+                                          augmentation_probabilities={k: 0.0 for k in [
+                                              "SevenBandParametricEQ", "TanhDistortion", "PitchShift",
+                                              "BandStopFilter", "AddColoredNoise", "AddBackgroundNoise",
+                                              "Gain", "RIR"]} if clean else {
+                                              "SevenBandParametricEQ": 0.25, "TanhDistortion": 0.25,
+                                              "PitchShift": 0.25, "BandStopFilter": 0.25, "AddColoredNoise": 0.25,
+                                              "AddBackgroundNoise": 0.75, "Gain": 1.0, "RIR": 0.5},
+                                          background_clip_paths=[] if clean else background_paths,
+                                          # real recordings already have the room's reverb
+                                          RIR_paths=rir_paths if src.get("rir", True) and not clean else [])
+                compute_features_from_generator(generator, n_total=len(clips), clip_duration=config["total_length"],
+                                                output_file=out_file,
+                                                device="gpu" if torch.cuda.is_available() else "cpu",
+                                                ncpu=n_cpus if not torch.cuda.is_available() else 1)
+
     # Create openwakeword model
     if args.train_model is True:
         F = openwakeword.utils.AudioFeatures(device='cpu')
         input_shape = np.load(os.path.join(feature_save_dir, "positive_features_test.npy")).shape[1:]
 
         oww = Model(n_classes=1, input_shape=input_shape, model_type=config["model_type"],
-                    layer_dim=config["layer_size"], seconds_per_example=1280*input_shape[0]/16000)
+                    layer_dim=config["layer_size"], seconds_per_example=1280*input_shape[0]/16000,
+                    eval_threshold=config.get("eval_threshold", 0.5), eval_patience=config.get("eval_patience", 1))
+        oww.checkpoint_dir = os.path.join(feature_save_dir, "checkpoints")
+        os.makedirs(oww.checkpoint_dir, exist_ok=True)
 
         # Create data transform function for batch generation to handle differ clip lengths (todo: write tests for this)
         def f(x, n=input_shape[0]):
@@ -847,6 +984,13 @@ if __name__ == '__main__':
         # Add generated positive and adversarial negative clips to the feature data files dictionary
         config["feature_data_files"]['positive'] = os.path.join(feature_save_dir, "positive_features_train.npy")
         config["feature_data_files"]['adversarial_negative'] = os.path.join(feature_save_dir, "negative_features_train.npy")
+
+        for name, src in config.get("extra_sources", {}).items():
+            config["feature_data_files"][name] = os.path.join(feature_save_dir, f"{name}_features_train.npy")
+            config["batch_n_per_class"][name] = src["batch_n"]
+            label_transforms[name] = lambda x, lbl=src["label"]: [lbl for i in x]
+            oww.extra_val[name] = (torch.from_numpy(np.load(os.path.join(feature_save_dir, f"{name}_features_test.npy"))),
+                                   src["label"])
 
         # Make PyTorch data loaders for training and validation data
         batch_generator = mmap_batch_generator(
@@ -876,7 +1020,8 @@ if __name__ == '__main__':
         X_val_fp_labels = np.zeros(X_val_fp.shape[0]).astype(np.float32)
         X_val_fp = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels)),
-            batch_size=len(X_val_fp_labels)
+            # One batch of all ~480k windows runs out of RAM for RNN models; FP counts are summed per batch
+            batch_size=8192
         )
 
         X_val_pos = np.load(os.path.join(feature_save_dir, "positive_features_test.npy"))
@@ -899,6 +1044,10 @@ if __name__ == '__main__':
             steps=config["steps"],
             max_negative_weight=config["max_negative_weight"],
             target_fp_per_hour=config["target_false_positives_per_hour"],
+            target_recall=config.get("target_recall", 0.0),
+            selection=config.get("checkpoint_selection", "average"),
+            metrics_csv=os.path.join(feature_save_dir, "checkpoints", "metrics.csv"),
+            recall_slack=config.get("selection_recall_slack", 0.03),
         )
 
         # Export the trained model to onnx

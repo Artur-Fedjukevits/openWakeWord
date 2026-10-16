@@ -142,3 +142,21 @@ examples/
 
 # archive files
 archive/
+
+# ── «Эй Лёня»: данные и модели (большие, в git не храним — см. WAKEWORD_PIPELINE.md) ──
+/audioset_16k/
+/fma/
+/fma_raw/
+/mit_rirs/
+/room_ambient/
+/room_background/
+/room_household/
+/room_household_bg/
+/dataset/
+/piper-sample-generator/
+/openwakeword_features_*.npy
+/openwakeword/resources/
+/.vscode/
+# модели, признаки и клипы — только история сравнений в git
+/my_custom_model/*
+!/my_custom_model/model_comparisons.md
